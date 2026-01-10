@@ -39,3 +39,7 @@ lerna-debug.log*
 .DS_Store
 Thumbs.db
 
+# Whisper 模型文件（如果将来需要本地模型）
+public/models/whisper/*.onnx
+dist/models/whisper/
+

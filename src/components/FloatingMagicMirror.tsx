@@ -1,24 +1,120 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, forwardRef, useImperativeHandle } from "react";
 import * as PIXI from "pixi.js";
-import { BlurFilter } from "pixi.js";
 // @ts-ignore - @sujoyu/pixi-live2d-display 类型定义可能不完整
 import { Live2DModel } from "@sujoyu/pixi-live2d-display/cubism4";
+import { setExpression as setExpressionService, playMotion as playMotionService } from "../services/expressionService";
 
 interface FloatingMagicMirrorProps {
   modelPath: string;
+  modelConfig?: {
+    position?: { x?: number; y?: number };
+    scale?: { factor?: number; baseWidth?: number; baseHeight?: number };
+  };
 }
 
-const FloatingMagicMirror: React.FC<FloatingMagicMirrorProps> = ({
+export interface FloatingMagicMirrorRef {
+  getModel: () => Live2DModel | null;
+  setExpression: (expressionName: string) => void;
+  playMotion: (motionName: string, priority?: number) => Promise<void>;
+}
+
+const FloatingMagicMirror = forwardRef<FloatingMagicMirrorRef, FloatingMagicMirrorProps>(({
   modelPath,
-}) => {
+  modelConfig,
+}, ref) => {
+  // 使用 ref 来跟踪之前的 modelPath，以便在路径变化时重新加载模型
+  const previousModelPathRef = useRef<string>(modelPath);
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const appRef = useRef<PIXI.Application | null>(null);
   const modelRef = useRef<Live2DModel | null>(null);
-  const glowRef = useRef<PIXI.Graphics | null>(null);
-  const mirrorFrameRef = useRef<PIXI.Graphics | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
   const startTimeRef = useRef<number>(Date.now());
+
+  // 暴露模型控制方法给父组件
+  useImperativeHandle(ref, () => ({
+    getModel: () => modelRef.current,
+    setExpression: (expressionName: string) => {
+      if (modelRef.current) {
+        // 使用 expressionService 来处理表情设置（包含模型特定的逻辑）
+        setExpressionService(modelRef.current, expressionName);
+      } else {
+        console.warn('模型实例不存在');
+      }
+    },
+    playMotion: async (motionName: string, priority: number = 0) => {
+      if (modelRef.current) {
+        // 使用 expressionService 来处理动作播放（包含模型特定的逻辑）
+        await playMotionService(modelRef.current, motionName, priority);
+      } else {
+        console.warn('模型实例不存在');
+      }
+    },
+  }));
+
+  // 当 modelPath 变化时，重新加载模型
+  useEffect(() => {
+    if (previousModelPathRef.current !== modelPath && appRef.current && modelRef.current) {
+      console.log('模型路径已更改，准备重新加载:', previousModelPathRef.current, '->', modelPath);
+      
+      // 从 stage 中移除旧模型
+      if (modelRef.current && appRef.current.stage) {
+        try {
+          appRef.current.stage.removeChild(modelRef.current);
+          modelRef.current.destroy();
+        } catch (e) {
+          console.warn('移除旧模型时出错:', e);
+        }
+        modelRef.current = null;
+      }
+      
+      // 加载新模型
+      const loadNewModel = async () => {
+        try {
+          const newModel = await Live2DModel.from(modelPath);
+          
+          // 设置模型位置和大小
+          newModel.anchor.set(0.5, 0.5);
+          const screenWidth = window.innerWidth;
+          const screenHeight = window.innerHeight;
+          
+          // 使用模型配置或默认值
+          const positionX = modelConfig?.position?.x ?? 0;
+          const positionY = modelConfig?.position?.y ?? 0;
+          const scaleFactor = modelConfig?.scale?.factor ?? 0.8;
+          const baseWidth = modelConfig?.scale?.baseWidth ?? 800;
+          const baseHeight = modelConfig?.scale?.baseHeight ?? 1000;
+          
+          // 计算位置
+          newModel.x = screenWidth / 2 + (screenWidth * positionX);
+          newModel.y = screenHeight / 2 + (screenHeight * positionY);
+          
+          // 计算缩放
+          const scale = Math.min(screenWidth / baseWidth, screenHeight / baseHeight) * scaleFactor;
+          newModel.scale.set(scale);
+          
+          console.log('新模型位置和缩放设置:', {
+            x: newModel.x,
+            y: newModel.y,
+            scale: scale,
+            config: modelConfig,
+          });
+          
+          // 添加到 stage
+          appRef.current?.stage.addChild(newModel);
+          modelRef.current = newModel;
+          
+          console.log('新模型加载成功:', modelPath);
+        } catch (error) {
+          console.error('加载新模型失败:', error);
+        }
+      };
+      
+      loadNewModel();
+      previousModelPathRef.current = modelPath;
+    } else if (previousModelPathRef.current !== modelPath) {
+      previousModelPathRef.current = modelPath;
+    }
+  }, [modelPath]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -104,29 +200,13 @@ const FloatingMagicMirror: React.FC<FloatingMagicMirrorProps> = ({
           console.warn("交互系统未初始化，Live2D 交互功能可能不可用");
         }
 
-        // 创建外圈蓝色光晕 - 使用 PixiJS v7 API
-        const glow = new PIXI.Graphics();
-        glow.beginFill(0x4a9eff, 0.4);
-        glow.drawEllipse(0, 0, 200, 300);
-        glow.endFill();
-        glow.filters = [new BlurFilter(20)];
-        glow.alpha = 0.6;
-        app.stage.addChild(glow);
-        glowRef.current = glow;
-
-        // 创建镜面框架（椭圆边框）- 使用 PixiJS v7 API
-        const mirrorFrame = new PIXI.Graphics();
-        mirrorFrame.lineStyle(3, 0x3a5aff, 0.6);
-        mirrorFrame.drawEllipse(0, 0, 180, 280);
-        mirrorFrame.alpha = 0.8;
-        app.stage.addChild(mirrorFrame);
-        mirrorFrameRef.current = mirrorFrame;
-
         // 加载 Live2D 模型
-        console.log("开始加载 Live2D 模型:", modelPath);
+        // 使用当前的 modelPath（从 props 获取）
+        const currentModelPath = modelPath;
+        console.log("开始加载 Live2D 模型:", currentModelPath);
 
         try {
-          const model = await Live2DModel.from(modelPath);
+          const model = await Live2DModel.from(currentModelPath);
 
           if (!isMounted) {
             model.destroy();
@@ -135,6 +215,18 @@ const FloatingMagicMirror: React.FC<FloatingMagicMirrorProps> = ({
 
           modelRef.current = model;
           console.log("Live2D 模型加载成功");
+          
+          // 调试：检查模型的所有方法和属性
+          console.log("模型可用方法:", Object.getOwnPropertyNames(Object.getPrototypeOf(model)));
+          console.log("模型 expression 方法:", typeof (model as any).expression);
+          console.log("模型 motion 方法:", typeof model.motion);
+          console.log("模型内部属性:", Object.keys(model));
+          
+          // 检查模型是否有内部模型
+          if ((model as any).internalModel) {
+            console.log("内部模型:", (model as any).internalModel);
+            console.log("内部模型方法:", Object.getOwnPropertyNames(Object.getPrototypeOf((model as any).internalModel)));
+          }
 
           // 禁用交互注册以避免兼容性问题
           // 在 PixiJS v7 中，交互系统已更改，需要手动处理
@@ -158,13 +250,29 @@ const FloatingMagicMirror: React.FC<FloatingMagicMirrorProps> = ({
           // 使用实际的窗口尺寸（不考虑 devicePixelRatio）
           const screenWidth = window.innerWidth;
           const screenHeight = window.innerHeight;
-          model.x = screenWidth / 2;
-          model.y = screenHeight / 2;
-          // 减小模型大小，使其完整显示在画面中
-          // 根据实际窗口尺寸计算缩放，确保模型不会太大
-          const scale = Math.min(screenWidth / 800, screenHeight / 1000) * 0.8; // 额外缩小 20%
+          
+          // 使用模型配置或默认值
+          const positionX = modelConfig?.position?.x ?? 0;
+          const positionY = modelConfig?.position?.y ?? 0;
+          const scaleFactor = modelConfig?.scale?.factor ?? 0.8;
+          const baseWidth = modelConfig?.scale?.baseWidth ?? 800;
+          const baseHeight = modelConfig?.scale?.baseHeight ?? 1000;
+          
+          // 计算位置（positionX/Y 是相对偏移，0 表示中心，-0.5 表示向上/左移动 50%）
+          model.x = screenWidth / 2 + (screenWidth * positionX);
+          model.y = screenHeight / 2 + (screenHeight * positionY);
+          
+          // 计算缩放
+          const scale = Math.min(screenWidth / baseWidth, screenHeight / baseHeight) * scaleFactor;
           model.scale.set(scale);
-          console.log(`模型缩放: ${scale}, 窗口尺寸: ${screenWidth}x${screenHeight}, 渲染尺寸: ${app.renderer?.width}x${app.renderer?.height}`);
+          
+          console.log('模型位置和缩放设置:', {
+            x: model.x,
+            y: model.y,
+            scale: scale,
+            config: modelConfig,
+            screenSize: `${screenWidth}x${screenHeight}`,
+          });
 
           // Live2DModel 继承自 PIXI.Container，可以直接添加到舞台
           app.stage.addChild(model as any);
@@ -187,19 +295,16 @@ const FloatingMagicMirror: React.FC<FloatingMagicMirrorProps> = ({
             console.warn("交互功能初始化失败，继续运行:", e);
           }
 
-          // 调整层级：光晕在最底层，镜面框架在中间，模型在最上层
-          app.stage.setChildIndex(glow, 0);
-          app.stage.setChildIndex(mirrorFrame, 1);
-          app.stage.setChildIndex(model as any, 2);
 
-          // 动画循环
-          const animate = () => {
-            if (!isMounted || !appRef.current) return;
+          // 保存初始位置（用于浮动动画）
+          const initialX = model.x;
+          const initialY = model.y;
+
+          // 使用 PixiJS ticker 进行动画循环（确保模型自动更新）
+          app.ticker.add(() => {
+            if (!isMounted || !appRef.current || !modelRef.current) return;
 
             const time = (Date.now() - startTimeRef.current) / 1000;
-            // 使用实际的窗口尺寸（不考虑 devicePixelRatio）
-            const screenHeight = window.innerHeight;
-            const screenWidth = window.innerWidth;
 
             // 上下浮动动画
             const floatY = Math.sin(time * 0.8) * 30;
@@ -207,34 +312,14 @@ const FloatingMagicMirror: React.FC<FloatingMagicMirrorProps> = ({
             const rotation = Math.sin(time * 0.5) * 0.15;
 
             // 应用动画到所有元素
+            // 注意：使用保存的初始位置，而不是屏幕中心，以支持模型配置的位置偏移
             if (modelRef.current) {
-              modelRef.current.x = screenWidth / 2;
-              modelRef.current.y = screenHeight / 2 + floatY;
+              modelRef.current.x = initialX;
+              modelRef.current.y = initialY + floatY;
               modelRef.current.rotation = rotation;
             }
 
-            if (glowRef.current) {
-              glowRef.current.x = screenWidth / 2;
-              glowRef.current.y = screenHeight / 2 + floatY;
-              glowRef.current.rotation = rotation;
-              // 光晕脉冲效果
-              const glowIntensity = 0.6 + Math.sin(time * 1.5) * 0.2;
-              glowRef.current.alpha = glowIntensity;
-            }
-
-            if (mirrorFrameRef.current) {
-              mirrorFrameRef.current.x = screenWidth / 2;
-              mirrorFrameRef.current.y = screenHeight / 2 + floatY;
-              mirrorFrameRef.current.rotation = rotation;
-              // 镜面发光呼吸效果
-              const breathIntensity = 0.8 + Math.sin(time * 0.6) * 0.2;
-              mirrorFrameRef.current.alpha = breathIntensity;
-            }
-
-            animationFrameRef.current = requestAnimationFrame(animate);
-          };
-
-          animate();
+          });
 
           // 处理窗口大小变化
           const handleResize = () => {
@@ -244,10 +329,16 @@ const FloatingMagicMirror: React.FC<FloatingMagicMirrorProps> = ({
             if (modelRef.current) {
               const width = window.innerWidth;
               const height = window.innerHeight;
-              modelRef.current.x = width / 2;
-              modelRef.current.y = height / 2;
-              // 使用与初始化相同的缩放比例
-              const scale = Math.min(width / 800, height / 1000) * 0.8;
+              // 使用模型配置的位置和缩放
+              const positionX = modelConfig?.position?.x ?? 0;
+              const positionY = modelConfig?.position?.y ?? 0;
+              const scaleFactor = modelConfig?.scale?.factor ?? 0.8;
+              const baseWidth = modelConfig?.scale?.baseWidth ?? 800;
+              const baseHeight = modelConfig?.scale?.baseHeight ?? 1000;
+              
+              modelRef.current.x = width / 2 + (width * positionX);
+              modelRef.current.y = height / 2 + (height * positionY);
+              const scale = Math.min(width / baseWidth, height / baseHeight) * scaleFactor;
               modelRef.current.scale.set(scale);
             }
           };
@@ -266,14 +357,20 @@ const FloatingMagicMirror: React.FC<FloatingMagicMirrorProps> = ({
     // 清理函数
     return () => {
       isMounted = false;
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current);
-      }
-      if (modelRef.current) {
-        modelRef.current.destroy();
-        modelRef.current = null;
-      }
       if (appRef.current) {
+        // 停止 ticker
+        appRef.current.ticker.stop();
+        // 清理模型
+        if (modelRef.current) {
+          try {
+            appRef.current.stage.removeChild(modelRef.current as any);
+            modelRef.current.destroy();
+          } catch (e) {
+            console.warn('清理模型时出错:', e);
+          }
+          modelRef.current = null;
+        }
+        // 销毁应用
         appRef.current.destroy(true);
         appRef.current = null;
       }
@@ -299,6 +396,8 @@ const FloatingMagicMirror: React.FC<FloatingMagicMirrorProps> = ({
       }}
     />
   );
-};
+});
+
+FloatingMagicMirror.displayName = 'FloatingMagicMirror';
 
 export default FloatingMagicMirror;
