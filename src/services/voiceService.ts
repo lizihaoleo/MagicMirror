@@ -9,15 +9,192 @@ let whisperModel: Pipeline | null = null;
 let isInitializing = false;
 let initPromise: Promise<Pipeline> | null = null;
 
+// Worker 模式（让主线程不卡）
+let whisperWorker: Worker | null = null;
+let workerInitPromise: Promise<void> | null = null;
+let requestSeq = 0;
+const pending = new Map<string, { resolve: (v: any) => void; reject: (e: any) => void }>();
+
+type WorkerResponse =
+  | { type: 'init:ok'; requestId: string }
+  | { type: 'transcribe:ok'; requestId: string; text: string }
+  | { type: 'error'; requestId: string; message: string; stack?: string };
+
 // 录音相关
 let mediaRecorder: MediaRecorder | null = null;
 let audioChunks: Blob[] = [];
 let audioStream: MediaStream | null = null;
 
+let platformLogged = false;
+
+function getRuntimePlatform() {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  const isMobile = /Android|iPhone|iPad|iPod/i.test(ua);
+  const hc = typeof navigator !== 'undefined' ? (navigator.hardwareConcurrency || 2) : 2;
+  return { ua, isMobile, hc };
+}
+
+function pickWhisperModelName() {
+  // 简化：所有平台默认 whisper-base；如需覆盖只用 VITE_WHISPER_MODEL
+  let modelName = (import.meta.env.VITE_WHISPER_MODEL as string | undefined) || 'Xenova/whisper-base';
+
+  // 检查是否尝试使用不支持的模型
+  if (modelName.includes('large-v3-turbo') && !modelName.startsWith('Xenova/')) {
+    console.warn('whisper-large-v3-turbo 目前还没有 Xenova ONNX 版本，回退到 whisper-base');
+    console.warn('Xenova 转换的模型列表: https://huggingface.co/Xenova');
+    modelName = 'Xenova/whisper-base';
+  }
+
+  return modelName;
+}
+
+function pickWhisperThreads() {
+  const { isMobile, hc } = getRuntimePlatform();
+  // 手机：1 线程最稳；桌面：最多 2 线程，避免抢占 UI
+  return isMobile ? 1 : Math.min(2, hc);
+}
+
+function supportsWhisperWorker(): boolean {
+  try {
+    return typeof Worker !== 'undefined';
+  } catch {
+    return false;
+  }
+}
+
+function makeRequestId(prefix: string) {
+  requestSeq += 1;
+  return `${prefix}-${Date.now()}-${requestSeq}`;
+}
+
+function resetWorkerAndRejectAll(reason: unknown) {
+  const error =
+    reason instanceof Error
+      ? reason
+      : new Error(typeof reason === 'string' ? reason : 'Whisper worker failed');
+
+  // Reject all in-flight worker requests so callers don't hang forever
+  for (const [requestId, entry] of pending.entries()) {
+    try {
+      entry.reject(error);
+    } catch {
+      // ignore
+    } finally {
+      pending.delete(requestId);
+    }
+  }
+  pending.clear();
+
+  // Reset worker state so we can recover (or fall back to main-thread)
+  try {
+    whisperWorker?.terminate();
+  } catch {
+    // ignore
+  }
+  whisperWorker = null;
+  workerInitPromise = null;
+}
+
+function ensureWorker(): Worker | null {
+  if (!supportsWhisperWorker()) return null;
+  if (whisperWorker) return whisperWorker;
+
+  try {
+    whisperWorker = new Worker(new URL('../workers/whisperWorker.ts', import.meta.url), { type: 'module' });
+    whisperWorker.onmessage = (ev: MessageEvent<WorkerResponse>) => {
+      const msg = ev.data;
+      const entry = pending.get(msg.requestId);
+      if (!entry) return;
+      pending.delete(msg.requestId);
+
+      if (msg.type === 'error') {
+        const e = new Error(msg.message);
+        (e as any).stack = msg.stack || (e as any).stack;
+        entry.reject(e);
+      } else {
+        entry.resolve(msg);
+      }
+    };
+    whisperWorker.onerror = (err) => {
+      console.error('Whisper worker error:', err);
+      resetWorkerAndRejectAll(err);
+    };
+    // If structured clone fails (e.g., non-serializable message), we must reject pending too.
+    whisperWorker.onmessageerror = (err) => {
+      console.error('Whisper worker message error:', err);
+      resetWorkerAndRejectAll(err);
+    };
+    return whisperWorker;
+  } catch (e) {
+    console.warn('无法创建 Whisper Worker，回退到主线程推理:', e);
+    whisperWorker = null;
+    return null;
+  }
+}
+
+function postToWorker(message: any, transfer?: Transferable[]): Promise<any> {
+  const w = ensureWorker();
+  if (!w) return Promise.reject(new Error('Whisper worker unavailable'));
+  return new Promise((resolve, reject) => {
+    pending.set(message.requestId, { resolve, reject });
+    try {
+      w.postMessage(message, transfer || []);
+    } catch (e) {
+      pending.delete(message.requestId);
+      reject(e);
+    }
+  });
+}
+
 /**
  * 初始化 Whisper 模型（仅首次加载）
  */
 export async function initWhisper(): Promise<Pipeline> {
+  // Debug once: verify mobile detection + UA
+  if (!platformLogged) {
+    const { ua, isMobile, hc } = getRuntimePlatform();
+    // 用“纯文本 + 分行”输出，避免某些控制台把对象折叠导致看不见值
+    console.log(`[Whisper] isMobile=${isMobile} hardwareConcurrency=${hc}`);
+    console.log(`[Whisper] userAgent=${ua}`);
+    console.log('[Whisper] runtime platform (object):', { isMobile, hardwareConcurrency: hc, userAgent: ua });
+    platformLogged = true;
+  }
+
+  // 优先使用 Worker 初始化（避免主线程卡顿）
+  const w = ensureWorker();
+  if (w) {
+    if (workerInitPromise) {
+      try {
+        await workerInitPromise;
+        // 返回一个占位对象（仅用于表示 ready；转写会走 worker）
+        return (whisperModel as any) || ({} as any);
+      } catch (e) {
+        // Worker init failed; reset state and fall back to main-thread init
+        console.warn('Whisper Worker 初始化失败，回退到主线程推理:', e);
+        resetWorkerAndRejectAll(e);
+      }
+    }
+
+    const { isMobile, hc } = getRuntimePlatform();
+    const modelName = pickWhisperModelName();
+    const threads = pickWhisperThreads();
+
+    workerInitPromise = (async () => {
+      const requestId = makeRequestId('init');
+      await postToWorker({ type: 'init', requestId, modelName, threads });
+      console.log('Whisper Worker 已就绪:', { modelName, threads, isMobile, hardwareConcurrency: hc });
+    })();
+
+    try {
+      await workerInitPromise;
+      return (whisperModel as any) || ({} as any);
+    } catch (e) {
+      console.warn('Whisper Worker 初始化失败，回退到主线程推理:', e);
+      resetWorkerAndRejectAll(e);
+      // Continue to main-thread init below
+    }
+  }
+
   if (whisperModel) {
     return whisperModel;
   }
@@ -41,15 +218,8 @@ export async function initWhisper(): Promise<Pipeline> {
       // 
       // 注意：whisper-large-v3-turbo 目前还没有 Xenova ONNX 版本
       // 如果将来可用，可以通过 VITE_WHISPER_MODEL 环境变量配置
-      const defaultModel = import.meta.env.VITE_WHISPER_MODEL || 'Xenova/whisper-base';
-      let modelName = defaultModel;
-      
-      // 检查是否尝试使用不支持的模型
-      if (modelName.includes('large-v3-turbo') && !modelName.startsWith('Xenova/')) {
-        console.warn('whisper-large-v3-turbo 目前还没有 Xenova ONNX 版本，回退到 whisper-base');
-        console.warn('Xenova 转换的模型列表: https://huggingface.co/Xenova');
-        modelName = 'Xenova/whisper-base';
-      }
+      const { isMobile, hc } = getRuntimePlatform();
+      let modelName = pickWhisperModelName();
       
       // 从 CDN 加载模型（transformers.js 会自动缓存到 IndexedDB）
       console.log('从 CDN 加载模型:', modelName);
@@ -64,6 +234,23 @@ export async function initWhisper(): Promise<Pipeline> {
         device: 'wasm', // 使用 WebAssembly
         quantized: true, // 使用量化模型以减小体积
       };
+
+      // 减少主线程压力：限制 wasm 线程数（移动端尤其明显）
+      // transformers.js 会把该配置透传给 onnxruntime-web wasm 后端
+      try {
+        const threads = pickWhisperThreads();
+        // @ts-ignore - env.backends 可能未在类型定义中暴露
+        env.backends = env.backends || {};
+        // @ts-ignore
+        env.backends.onnx = env.backends.onnx || {};
+        // @ts-ignore
+        env.backends.onnx.wasm = env.backends.onnx.wasm || {};
+        // @ts-ignore
+        env.backends.onnx.wasm.numThreads = threads;
+        console.log('Whisper WASM threads:', threads, '(isMobile:', isMobile, 'hardwareConcurrency:', hc, ')');
+      } catch {
+        // ignore
+      }
       
       // 不设置 local_files_only，始终允许从 CDN 下载
       // transformers.js 会自动将模型缓存到浏览器的 IndexedDB
@@ -93,16 +280,27 @@ export async function initWhisper(): Promise<Pipeline> {
  * 开始录音
  */
 export async function startRecording(): Promise<void> {
+  let stream: MediaStream | null = null;
   try {
     // 请求麦克风权限
-    audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     
     // 创建 MediaRecorder
-    mediaRecorder = new MediaRecorder(audioStream, {
-      mimeType: 'audio/webm;codecs=opus',
+    const mimeType = 'audio/webm;codecs=opus';
+    if (!MediaRecorder.isTypeSupported(mimeType)) {
+      // 清理已打开的流
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+      throw new Error(`不支持的音频格式: ${mimeType}`);
+    }
+    
+    mediaRecorder = new MediaRecorder(stream, {
+      mimeType: mimeType,
     });
 
     audioChunks = [];
+    audioStream = stream; // 保存引用以便后续清理
 
     mediaRecorder.ondataavailable = (event) => {
       if (event.data.size > 0) {
@@ -114,6 +312,13 @@ export async function startRecording(): Promise<void> {
     console.log('开始录音');
   } catch (error) {
     console.error('录音启动失败:', error);
+    // 确保清理已打开的流
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+    }
+    // 清理引用
+    audioStream = null;
+    mediaRecorder = null;
     throw error;
   }
 }
@@ -156,8 +361,8 @@ export async function stopRecording(): Promise<Blob | null> {
  */
 export async function transcribeAudio(audioBlob: Blob): Promise<string> {
   try {
-    // 确保模型已加载
-    const model = await initWhisper();
+    // 确保模型已加载（可能是 worker）
+    await initWhisper();
 
     console.log('开始语音识别...');
     
@@ -165,24 +370,51 @@ export async function transcribeAudio(audioBlob: Blob): Promise<string> {
     const audioUrl = URL.createObjectURL(audioBlob);
     
     try {
-      // 使用 read_audio 读取音频数据
-      // Whisper 模型需要 Float32Array 格式的音频数据
-      // read_audio 的第二个参数是采样率（number），Whisper 使用 16kHz
+      // 使用 read_audio 读取音频数据（主线程做 I/O / 解码）
+      // 然后把 Float32Array 传给 worker 进行推理（避免主线程卡顿）
       const audioData = await read_audio(audioUrl, 16000);
       
       console.log('音频数据读取完成，长度:', audioData.length);
-      
-      // 使用 Whisper 转写
-      const result = await model(audioData, {
-        language: 'zh', // 中文
+
+      const w = ensureWorker();
+      if (w) {
+        // Keep a copy for fallback because transferring the buffer detaches it
+        const audioForFallback = audioData.slice();
+        try {
+          const requestId = makeRequestId('transcribe');
+          const resp = await postToWorker(
+            { type: 'transcribe', requestId, audioBuffer: audioData.buffer, language: 'zh' },
+            [audioData.buffer]
+          );
+          const text = (resp as any)?.text || '';
+          console.log('识别结果(Worker):', text);
+          return String(text).trim();
+        } catch (e) {
+          console.warn('Whisper Worker 转写失败，回退到主线程推理:', e);
+          resetWorkerAndRejectAll(e);
+          // Fallback to main-thread using the preserved copy
+          const model = whisperModel || (await initWhisper());
+          const result = await (model as any)(audioForFallback, {
+            language: 'zh',
+            task: 'transcribe',
+            return_timestamps: false,
+          });
+          const text = (result as any).text || '';
+          console.log('识别结果(Main fallback):', text);
+          return String(text).trim();
+        }
+      }
+
+      // Worker 不可用时回退到主线程推理
+      const model = whisperModel || (await initWhisper());
+      const result = await (model as any)(audioData, {
+        language: 'zh',
         task: 'transcribe',
         return_timestamps: false,
       });
-
       const text = (result as any).text || '';
-      console.log('识别结果:', text);
-      
-      return text.trim();
+      console.log('识别结果(Main):', text);
+      return String(text).trim();
     } finally {
       // 清理临时 URL
       URL.revokeObjectURL(audioUrl);

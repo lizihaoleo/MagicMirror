@@ -12,11 +12,23 @@ export interface ChatMessage {
 }
 
 // LLM API 配置
-const LLM_CONFIG = {
-  provider: 'groq' as 'groq' | 'huggingface',
-  apiKey: import.meta.env.VITE_GROQ_API_KEY || import.meta.env.VITE_LLM_API_KEY || '',
-  model: 'llama-3.1-8b-instant', // Groq 模型
-  baseURL: 'https://api.groq.com/openai/v1',
+const getLLMConfig = () => {
+  const provider = (import.meta.env.VITE_LLM_PROVIDER || 'groq') as 'groq' | 'huggingface';
+  
+  if (provider === 'huggingface') {
+    return {
+      provider: 'huggingface' as const,
+      apiKey: import.meta.env.VITE_HUGGINGFACE_API_KEY || '',
+      model: import.meta.env.VITE_HUGGINGFACE_MODEL || 'meta-llama/Meta-Llama-3-8B-Instruct',
+    };
+  } else {
+    return {
+      provider: 'groq' as const,
+      apiKey: import.meta.env.VITE_GROQ_API_KEY || import.meta.env.VITE_LLM_API_KEY || '',
+      model: 'llama-3.1-8b-instant',
+      baseURL: 'https://api.groq.com/openai/v1',
+    };
+  }
 };
 
 /**
@@ -66,6 +78,11 @@ function parseLLMResponse(response: string): LLMResponse {
  * @param availableMotions 当前模型可用的动作列表
  */
 function buildSystemPrompt(availableExpressions: string[] = [], availableMotions: string[] = []): string {
+  // Debug: 打印传入的可用表情/动作（用于确认 provider 和列表是否正确工作）
+  // 注意：这里会在每次构建 prompt 时打印一次
+  console.log('[LLM] availableExpressions:', availableExpressions);
+  console.log('[LLM] availableMotions:', availableMotions);
+
   const expressionsList = availableExpressions.length > 0 
     ? availableExpressions.join(', ')
     : 'happy, sad, surprised, angry, shy, curious, blush, pout';
@@ -93,6 +110,66 @@ function buildSystemPrompt(availableExpressions: string[] = [], availableMotions
 - 表情和动作应该与回复内容的情感相匹配`;
 }
 
+function normalizeToken(input: string): string {
+  const s = input.trim().toLowerCase();
+  // 常见拼写/同义词纠正
+  if (s === 'suprise' || s === 'surprise') return 'surprised';
+  return s;
+}
+
+function buildCanonicalMap(list: string[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const item of list) {
+    map.set(normalizeToken(item), item);
+  }
+  return map;
+}
+
+function sanitizeLLMChoice(
+  parsed: LLMResponse,
+  availableExpressions: string[],
+  availableMotions: string[]
+): LLMResponse {
+  const exprMap = buildCanonicalMap(availableExpressions);
+  const motionMap = buildCanonicalMap(availableMotions);
+
+  const sanitized: LLMResponse = { ...parsed };
+
+  const rawExpr = typeof parsed.expression === 'string' ? parsed.expression : undefined;
+  const rawMotion = typeof parsed.motion === 'string' ? parsed.motion : undefined;
+
+  const expr = rawExpr ? normalizeToken(rawExpr) : undefined;
+  const motion = rawMotion ? normalizeToken(rawMotion) : undefined;
+
+  // expression 校验
+  if (expr && !exprMap.has(expr)) {
+    console.warn('[LLM] expression not in availableExpressions, dropping:', rawExpr, 'normalized:', expr);
+    delete (sanitized as any).expression;
+  } else if (expr) {
+    // 保持模型/列表里的原始大小写（例如 Idle_2 / EyesLove）
+    sanitized.expression = exprMap.get(expr);
+  }
+
+  // motion 校验
+  if (motion && !motionMap.has(motion)) {
+    // 如果 LLM 把表情写到 motion 字段里，且 expression 为空，则尝试修正
+    const hasExpr = typeof sanitized.expression === 'string' && sanitized.expression.length > 0;
+    if (!hasExpr && exprMap.has(motion)) {
+      console.warn('[LLM] motion looks like an expression; moving to expression:', rawMotion, '->', motion);
+      sanitized.expression = exprMap.get(motion);
+      delete (sanitized as any).motion;
+    } else {
+      console.warn('[LLM] motion not in availableMotions, dropping:', rawMotion, 'normalized:', motion);
+      delete (sanitized as any).motion;
+    }
+  } else if (motion) {
+    // 保持模型/列表里的原始大小写（例如 Idle_2 / Love / Shock）
+    sanitized.motion = motionMap.get(motion);
+  }
+
+  return sanitized;
+}
+
 /**
  * 发送消息到 LLM 并获取回复
  * @param message 用户消息
@@ -106,7 +183,19 @@ export async function chat(
   availableExpressions: string[] = [],
   availableMotions: string[] = []
 ): Promise<LLMResponse> {
-  if (!LLM_CONFIG.apiKey) {
+  const config = getLLMConfig();
+  
+  // 根据配置的 provider 选择使用哪个服务
+  if (config.provider === 'huggingface') {
+    if (!config.apiKey) {
+      throw new Error('Hugging Face API Key 未配置，请在 .env 文件中设置 VITE_HUGGINGFACE_API_KEY');
+    }
+    const raw = await chatWithHuggingFace(message, history, availableExpressions, availableMotions);
+    return sanitizeLLMChoice(raw, availableExpressions, availableMotions);
+  }
+  
+  // 使用 Groq
+  if (!config.apiKey) {
     throw new Error('Groq API Key 未配置，请在 .env 文件中设置 VITE_GROQ_API_KEY');
   }
 
@@ -126,12 +215,12 @@ export async function chat(
       },
     ];
 
-    console.log('发送消息到 LLM...');
+    console.log('发送消息到 LLM (Groq)...');
 
     const response = await axios.post(
-      `${LLM_CONFIG.baseURL}/chat/completions`,
+      `${config.baseURL}/chat/completions`,
       {
-        model: LLM_CONFIG.model,
+        model: config.model,
         messages,
         temperature: 0.7,
         max_tokens: 500,
@@ -139,7 +228,7 @@ export async function chat(
       },
       {
         headers: {
-          'Authorization': `Bearer ${LLM_CONFIG.apiKey}`,
+          'Authorization': `Bearer ${config.apiKey}`,
           'Content-Type': 'application/json',
         },
         timeout: 30000, // 30 秒超时
@@ -150,9 +239,11 @@ export async function chat(
     console.log('LLM 原始回复:', content);
 
     const parsed = parseLLMResponse(content);
+    const sanitized = sanitizeLLMChoice(parsed, availableExpressions, availableMotions);
     console.log('解析后的回复:', parsed);
+    console.log('清洗后的回复:', sanitized);
 
-    return parsed;
+    return sanitized;
   } catch (error: any) {
     console.error('LLM API 调用失败:', error);
     

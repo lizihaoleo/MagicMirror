@@ -141,3 +141,42 @@ export function isTTSSupported(): boolean {
   return 'speechSynthesis' in window;
 }
 
+/**
+ * 在移动端“解锁”语音合成（需要在用户手势事件里调用，比如按钮点击）
+ *
+ * 许多移动端浏览器会阻止在异步链路（await Whisper/LLM）之后再触发的语音播放，
+ * 但如果在用户点击时先触发一次（哪怕是静音/极短）speechSynthesis，就会允许后续播放。
+ */
+export function primeTTS(): void {
+  try {
+    if (!isTTSSupported()) return;
+
+    // 有些浏览器会处于 paused 状态
+    try {
+      window.speechSynthesis.resume();
+    } catch {
+      // ignore
+    }
+
+    // 使用极短、静音的 utterance 来“解锁”
+    const u = new SpeechSynthesisUtterance(' ');
+    u.lang = 'en-US';
+    u.volume = 0;     // 静音
+    u.rate = 10;      // 尽快结束
+    u.pitch = 1;
+
+    // 触发一次 speak（在用户手势里）
+    window.speechSynthesis.speak(u);
+
+    // 避免队列堆积；稍后 cancel
+    setTimeout(() => {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // ignore
+      }
+    }, 50);
+  } catch {
+    // ignore
+  }
+}

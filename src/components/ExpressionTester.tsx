@@ -13,7 +13,7 @@ const ExpressionTester: React.FC<ExpressionTesterProps> = ({ mirrorRef }) => {
   const [testResult, setTestResult] = useState<string>('');
   const [actualExpressions, setActualExpressions] = useState<Array<{ name: string; display: string }>>([]);
   const [actualMotions, setActualMotions] = useState<Array<{ name: string; display: string }>>([]);
-  const [isCollapsed, setIsCollapsed] = useState<boolean>(false);
+  const [isCollapsed, setIsCollapsed] = useState<boolean>(true);
 
   // 从模型实例中获取实际的表情和动作列表
   useEffect(() => {
@@ -116,87 +116,87 @@ const ExpressionTester: React.FC<ExpressionTesterProps> = ({ mirrorRef }) => {
       {!isCollapsed && (
         <>
           {/* 直接测试表情文件 */}
-      <div style={{ marginBottom: '15px' }}>
-        <label style={{ display: 'block', marginBottom: '8px', fontSize: '14px' }}>
-          直接测试表情文件:
-        </label>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
-          {actualExpressions.map((exp) => (
-            <button
-              key={exp.name}
-              onClick={() => testDirectExpression(exp.name)}
+          <div style={{ marginBottom: '15px' }}>
+            <label style={{ display: 'block', marginBottom: '8px', fontSize: '14px' }}>
+              直接测试表情文件:
+            </label>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+              {actualExpressions.map((exp) => (
+                <button
+                  key={exp.name}
+                  onClick={() => testDirectExpression(exp.name)}
+                  style={{
+                    padding: '6px 8px',
+                    borderRadius: '6px',
+                    backgroundColor: 'rgba(74, 158, 255, 0.3)',
+                    color: 'white',
+                    border: '1px solid rgba(74, 158, 255, 0.5)',
+                    cursor: 'pointer',
+                    fontSize: '12px',
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.backgroundColor = 'rgba(74, 158, 255, 0.5)';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.backgroundColor = 'rgba(74, 158, 255, 0.3)';
+                  }}
+                >
+                  {exp.display}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* 直接测试动作文件 */}
+          <div style={{ marginBottom: '15px' }}>
+            <label style={{ display: 'block', marginBottom: '8px', fontSize: '14px' }}>
+              直接测试动作文件:
+            </label>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+              {actualMotions.map((motion) => (
+                <button
+                  key={motion.name}
+                  onClick={() => testDirectMotion(motion.name)}
+                  style={{
+                    padding: '6px 8px',
+                    borderRadius: '6px',
+                    backgroundColor: 'rgba(74, 158, 255, 0.3)',
+                    color: 'white',
+                    border: '1px solid rgba(74, 158, 255, 0.5)',
+                    cursor: 'pointer',
+                    fontSize: '12px',
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.backgroundColor = 'rgba(74, 158, 255, 0.5)';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.backgroundColor = 'rgba(74, 158, 255, 0.3)';
+                  }}
+                >
+                  {motion.display}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* 测试结果 */}
+          {testResult && (
+            <div
               style={{
-                padding: '6px 8px',
+                marginTop: '15px',
+                padding: '10px',
                 borderRadius: '6px',
-                backgroundColor: 'rgba(74, 158, 255, 0.3)',
-                color: 'white',
-                border: '1px solid rgba(74, 158, 255, 0.5)',
-                cursor: 'pointer',
-                fontSize: '12px',
-              }}
-              onMouseEnter={(e) => {
-                e.currentTarget.style.backgroundColor = 'rgba(74, 158, 255, 0.5)';
-              }}
-              onMouseLeave={(e) => {
-                e.currentTarget.style.backgroundColor = 'rgba(74, 158, 255, 0.3)';
+                backgroundColor: testResult.includes('错误')
+                  ? 'rgba(255, 68, 68, 0.2)'
+                  : 'rgba(74, 158, 255, 0.2)',
+                color: testResult.includes('错误') ? '#ff4444' : '#4a9eff',
+                fontSize: '13px',
+                border: `1px solid ${testResult.includes('错误') ? '#ff4444' : '#4a9eff'}`,
               }}
             >
-              {exp.display}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* 直接测试动作文件 */}
-      <div style={{ marginBottom: '15px' }}>
-        <label style={{ display: 'block', marginBottom: '8px', fontSize: '14px' }}>
-          直接测试动作文件:
-        </label>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
-          {actualMotions.map((motion) => (
-            <button
-              key={motion.name}
-              onClick={() => testDirectMotion(motion.name)}
-              style={{
-                padding: '6px 8px',
-                borderRadius: '6px',
-                backgroundColor: 'rgba(74, 158, 255, 0.3)',
-                color: 'white',
-                border: '1px solid rgba(74, 158, 255, 0.5)',
-                cursor: 'pointer',
-                fontSize: '12px',
-              }}
-              onMouseEnter={(e) => {
-                e.currentTarget.style.backgroundColor = 'rgba(74, 158, 255, 0.5)';
-              }}
-              onMouseLeave={(e) => {
-                e.currentTarget.style.backgroundColor = 'rgba(74, 158, 255, 0.3)';
-              }}
-            >
-              {motion.display}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* 测试结果 */}
-      {testResult && (
-        <div
-          style={{
-            marginTop: '15px',
-            padding: '10px',
-            borderRadius: '6px',
-            backgroundColor: testResult.includes('错误') 
-              ? 'rgba(255, 68, 68, 0.2)' 
-              : 'rgba(74, 158, 255, 0.2)',
-            color: testResult.includes('错误') ? '#ff4444' : '#4a9eff',
-            fontSize: '13px',
-            border: `1px solid ${testResult.includes('错误') ? '#ff4444' : '#4a9eff'}`,
-          }}
-        >
-          {testResult}
-        </div>
-      )}
+              {testResult}
+            </div>
+          )}
         </>
       )}
     </div>

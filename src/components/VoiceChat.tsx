@@ -8,7 +8,14 @@ import {
 } from '../services/voiceService';
 import { chat, ChatMessage, LLMResponse } from '../services/llmService';
 import { speak, stopSpeaking, isTTSSupported } from '../services/ttsService';
-import { applyExpressionAndMotion, getAvailableExpressions, getAvailableMotions } from '../services/expressionService';
+import {
+  applyExpressionAndMotion,
+  getActualExpressions,
+  getActualMotions,
+  getAvailableExpressions,
+  getAvailableMotions,
+} from '../services/expressionService';
+import { speakWithLipSync } from '../services/lipSyncService';
 import { FloatingMagicMirrorRef } from './FloatingMagicMirror';
 // @ts-ignore
 import { Live2DModel } from '@sujoyu/pixi-live2d-display/cubism4';
@@ -25,6 +32,72 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ mirrorRef }) => {
   const [conversationHistory, setConversationHistory] = useState<ChatMessage[]>([]);
   const [isWhisperReady, setIsWhisperReady] = useState(false);
   const [transcribedText, setTranscribedText] = useState<string>('');
+
+  const nextFrame = async () => {
+    // 让浏览器先渲染一帧（移动端在 Whisper/LLM 等重计算前非常关键）
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+  };
+
+  const pickThinkingMotion = (model: Live2DModel): string | null => {
+    const actual = getActualMotions(model).map(m => m.name);
+    const preferred = ['Curious', 'Idle_2', 'Idle', 'Komi', 'Happy', 'Love', 'Shock'];
+    return preferred.find(name => actual.includes(name)) || actual[0] || null;
+  };
+
+  const pickThinkingExpression = (model: Live2DModel): string | null => {
+    const actual = getActualExpressions(model).map(e => e.name);
+    const preferred = ['curious', 'eye_size', 'SignShock', 'EyesLove', 'blush', 'mouth'];
+    return preferred.find(name => actual.includes(name)) || actual[0] || null;
+  };
+
+  const applyThinkingPose = async () => {
+    const model = mirrorRef.current?.getModel();
+    if (!model) return;
+
+    // 这里不用 await，让 UI 更快进入状态；失败也不影响主流程
+    try {
+      const motion = pickThinkingMotion(model);
+      if (motion) {
+        mirrorRef.current?.playMotion(motion);
+      }
+      const expression = pickThinkingExpression(model);
+      if (expression) {
+        mirrorRef.current?.setExpression(expression);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  /**
+   * 在移动端“解锁”语音合成（需要在用户手势事件里调用，比如按钮点击）
+   * 备注：放在组件内避免出现模块导出缓存/不一致导致的启动失败
+   */
+  const primeTTS = () => {
+    try {
+      if (!('speechSynthesis' in window)) return;
+      try {
+        window.speechSynthesis.resume();
+      } catch {
+        // ignore
+      }
+      const u = new SpeechSynthesisUtterance(' ');
+      u.lang = 'en-US';
+      u.volume = 0;
+      u.rate = 10;
+      u.pitch = 1;
+      window.speechSynthesis.speak(u);
+      setTimeout(() => {
+        try {
+          window.speechSynthesis.cancel();
+        } catch {
+          // ignore
+        }
+      }, 50);
+    } catch {
+      // ignore
+    }
+  };
 
   // 初始化 Whisper 模型（在组件加载时）
   useEffect(() => {
@@ -95,15 +168,19 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ mirrorRef }) => {
     try {
       if (state !== 'recording') return;
 
-      // 停止录音
+      // 先进入“识别中”状态并展示思考动作/表情，然后再做任何重计算
+      setState('transcribing');
+      await applyThinkingPose();
+      await nextFrame();
+
+      // 停止录音（相对轻量）
       const audioBlob = await stopRecording();
       if (!audioBlob) {
         setState('idle');
         return;
       }
 
-      // 转写语音
-      setState('transcribing');
+      // 转写语音（重计算，可能导致掉帧/卡顿）
       const text = await transcribeAudio(audioBlob);
       setTranscribedText(text);
 
@@ -120,8 +197,14 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ mirrorRef }) => {
 
       // 调用 LLM（传入当前模型可用的表情和动作）
       setState('thinking');
-      const availableExpressions = getAvailableExpressions();
-      const availableMotions = getAvailableMotions();
+      await applyThinkingPose();
+      await nextFrame();
+      const modelForLists = mirrorRef.current?.getModel() || null;
+      // 优先使用 model3.json 中真实可用的 Name（避免把映射 key 传给 LLM）
+      const availableExpressions =
+        modelForLists ? getActualExpressions(modelForLists).map(e => e.name) : getAvailableExpressions();
+      const availableMotions =
+        modelForLists ? getActualMotions(modelForLists).map(m => m.name) : getAvailableMotions();
       const response: LLMResponse = await chat(text, conversationHistory, availableExpressions, availableMotions);
 
       // 更新对话历史
@@ -145,13 +228,22 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ mirrorRef }) => {
         console.warn('无法获取 Live2D 模型实例');
       }
 
-      // 播放 TTS
+      // 播放 TTS 并同步口型
       setState('speaking');
-      await speak(response.text, 'zh-CN', {
-        rate: 1.0,
-        pitch: 1.0,
-        volume: 1.0,
-      });
+      if (model) {
+        await speakWithLipSync(response.text, model, 'zh-CN', {
+          rate: 1.0,
+          pitch: 1.0,
+          volume: 1.0,
+        });
+      } else {
+        // 如果没有模型实例，使用普通 TTS（无口型同步）
+        await speak(response.text, 'zh-CN', {
+          rate: 1.0,
+          pitch: 1.0,
+          volume: 1.0,
+        });
+      }
 
       setState('idle');
     } catch (error: any) {
@@ -165,6 +257,11 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ mirrorRef }) => {
    * 处理麦克风按钮点击
    */
   const handleMicClick = async () => {
+    // 移动端需要在用户手势里先“解锁”speechSynthesis，否则异步链路结束后可能无法播放
+    if (state === 'idle' || state === 'recording') {
+      primeTTS();
+    }
+
     if (state === 'idle') {
       await handleConversation();
     } else if (state === 'recording') {
