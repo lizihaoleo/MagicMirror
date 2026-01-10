@@ -67,6 +67,34 @@ function makeRequestId(prefix: string) {
   return `${prefix}-${Date.now()}-${requestSeq}`;
 }
 
+function resetWorkerAndRejectAll(reason: unknown) {
+  const error =
+    reason instanceof Error
+      ? reason
+      : new Error(typeof reason === 'string' ? reason : 'Whisper worker failed');
+
+  // Reject all in-flight worker requests so callers don't hang forever
+  for (const [requestId, entry] of pending.entries()) {
+    try {
+      entry.reject(error);
+    } catch {
+      // ignore
+    } finally {
+      pending.delete(requestId);
+    }
+  }
+  pending.clear();
+
+  // Reset worker state so we can recover (or fall back to main-thread)
+  try {
+    whisperWorker?.terminate();
+  } catch {
+    // ignore
+  }
+  whisperWorker = null;
+  workerInitPromise = null;
+}
+
 function ensureWorker(): Worker | null {
   if (!supportsWhisperWorker()) return null;
   if (whisperWorker) return whisperWorker;
@@ -89,6 +117,12 @@ function ensureWorker(): Worker | null {
     };
     whisperWorker.onerror = (err) => {
       console.error('Whisper worker error:', err);
+      resetWorkerAndRejectAll(err);
+    };
+    // If structured clone fails (e.g., non-serializable message), we must reject pending too.
+    whisperWorker.onmessageerror = (err) => {
+      console.error('Whisper worker message error:', err);
+      resetWorkerAndRejectAll(err);
     };
     return whisperWorker;
   } catch (e) {
@@ -103,7 +137,12 @@ function postToWorker(message: any, transfer?: Transferable[]): Promise<any> {
   if (!w) return Promise.reject(new Error('Whisper worker unavailable'));
   return new Promise((resolve, reject) => {
     pending.set(message.requestId, { resolve, reject });
-    w.postMessage(message, transfer || []);
+    try {
+      w.postMessage(message, transfer || []);
+    } catch (e) {
+      pending.delete(message.requestId);
+      reject(e);
+    }
   });
 }
 
@@ -125,9 +164,15 @@ export async function initWhisper(): Promise<Pipeline> {
   const w = ensureWorker();
   if (w) {
     if (workerInitPromise) {
-      await workerInitPromise;
-      // 返回一个占位对象（仅用于表示 ready；转写会走 worker）
-      return (whisperModel as any) || ({} as any);
+      try {
+        await workerInitPromise;
+        // 返回一个占位对象（仅用于表示 ready；转写会走 worker）
+        return (whisperModel as any) || ({} as any);
+      } catch (e) {
+        // Worker init failed; reset state and fall back to main-thread init
+        console.warn('Whisper Worker 初始化失败，回退到主线程推理:', e);
+        resetWorkerAndRejectAll(e);
+      }
     }
 
     const { isMobile, hc } = getRuntimePlatform();
@@ -140,8 +185,14 @@ export async function initWhisper(): Promise<Pipeline> {
       console.log('Whisper Worker 已就绪:', { modelName, threads, isMobile, hardwareConcurrency: hc });
     })();
 
-    await workerInitPromise;
-    return (whisperModel as any) || ({} as any);
+    try {
+      await workerInitPromise;
+      return (whisperModel as any) || ({} as any);
+    } catch (e) {
+      console.warn('Whisper Worker 初始化失败，回退到主线程推理:', e);
+      resetWorkerAndRejectAll(e);
+      // Continue to main-thread init below
+    }
   }
 
   if (whisperModel) {
@@ -327,14 +378,31 @@ export async function transcribeAudio(audioBlob: Blob): Promise<string> {
 
       const w = ensureWorker();
       if (w) {
-        const requestId = makeRequestId('transcribe');
-        const resp = await postToWorker(
-          { type: 'transcribe', requestId, audioBuffer: audioData.buffer, language: 'zh' },
-          [audioData.buffer]
-        );
-        const text = (resp as any)?.text || '';
-        console.log('识别结果(Worker):', text);
-        return String(text).trim();
+        // Keep a copy for fallback because transferring the buffer detaches it
+        const audioForFallback = audioData.slice();
+        try {
+          const requestId = makeRequestId('transcribe');
+          const resp = await postToWorker(
+            { type: 'transcribe', requestId, audioBuffer: audioData.buffer, language: 'zh' },
+            [audioData.buffer]
+          );
+          const text = (resp as any)?.text || '';
+          console.log('识别结果(Worker):', text);
+          return String(text).trim();
+        } catch (e) {
+          console.warn('Whisper Worker 转写失败，回退到主线程推理:', e);
+          resetWorkerAndRejectAll(e);
+          // Fallback to main-thread using the preserved copy
+          const model = whisperModel || (await initWhisper());
+          const result = await (model as any)(audioForFallback, {
+            language: 'zh',
+            task: 'transcribe',
+            return_timestamps: false,
+          });
+          const text = (result as any).text || '';
+          console.log('识别结果(Main fallback):', text);
+          return String(text).trim();
+        }
       }
 
       // Worker 不可用时回退到主线程推理
